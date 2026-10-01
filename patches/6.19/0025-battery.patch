@@ -1,30 +1,47 @@
-From 737047b331d63a5c0455e1b77a1596f32040a3ff Mon Sep 17 00:00:00 2001
+From c267cd2c3e5df9f5d6321a90d4e0d49baa544ede Mon Sep 17 00:00:00 2001
 From: Rohan Sharma <rohansh.lko@gmail.com>
-Date: Thu, 1 Oct 2026 15:55:24 +0200
-Subject: [PATCH] ACPI: battery: Ignore bogus _BST present rate on Surface Pro
- 5
+Date: Thu, 1 Oct 2026 16:27:05 +0200
+Subject: [PATCH] ACPI: battery: Derive discharge rate on Surface Pro 5
 
 The Surface Pro 5 (Surface Pro 2017) reports a present rate in _BST
-that is both far too large and extremely unstable. Measured on an
-m3-7Y30 / 45Wh unit at an idle desktop:
+that is unusable. Sampled every 2s for 10 minutes on an idle m3-7Y30 /
+45Wh unit, against the energy counter as ground truth:
 
-  energy_now delta over 120s:    2.40 W   (ground truth)
-  power_now as reported:        33.78 W
-  rate seen by upower:          12.9 W .. 60.5 W within 90s
+  energy_now delta       :  3.72 W   (ground truth)
+  _BST present rate mean : 31.95 W   (8.6x high)
+  _BST present rate range:  0.32 W .. 65.43 W
 
-2.40 W is the real figure: it matches the observed 15-20h runtime and
-is the only value consistent with the hardware. 60 W is impossible on
-this machine several times over - the m3-7Y30 is a 4.5 W TDP fanless
-part, and the bundled Surface Connect PSU supplies at most 44 W, so
-the pack cannot source that power even in principle.
+The error is neither constant nor zero-mean, so the value cannot be
+rescaled or averaged into something useful. It is simply junk.
 
-The practical fallout is that upower's energy-rate is garbage, so the
-desktop reports "3.0 hours" remaining on a battery that actually lasts
-roughly 16 hours.
+65 W is impossible on this machine several times over: the m3-7Y30 is a
+4.5 W TDP fanless part and the bundled Surface Connect PSU supplies at
+most 44 W, so the pack cannot source that power even in principle.
 
-The capacity values from _BST are sound, so only the rate is
-suppressed. Once power_now is gone userspace falls back to
-differentiating the energy counter, which tracks the real draw.
+The fallout is a desktop that reports "3.0 hours" remaining on a
+battery which in practice lasts around 16.
+
+Simply suppressing the rate is not enough. upower reads power_now and,
+despite a comment promising a fallback, never reconstructs the rate
+from the energy counter:
+
+	values.energy.rate = fabs (... "power_now" ...);
+	/* Legacy case: If we have energy units but no power_now, ... */
+	if (values.energy.rate < 0)	    /* dead: fabs() */
+
+so hiding the attribute yields no estimate at all rather than a correct
+one. Derive the rate in the driver instead, by differentiating
+capacity_now over a window of at least a minute.
+
+The capacity counter is quantised at 10 mWh here, about ten seconds of
+charge at idle, so the window is grown until at least one step has been
+consumed. This makes the reported rate an average and it will not
+follow short bursts, which is the right trade for runtime estimation
+and is all the counter can support anyway.
+
+The window is reset on resume and whenever the battery is not
+discharging, since neither jiffies nor the counter are meaningful
+across those boundaries.
 
 The DMI match is deliberately exact. DMI_MATCH() is a substring match
 and the 2017 model's product name, "Surface Pro", is a prefix of every
@@ -35,14 +52,28 @@ Tested on Surface Pro 2017, firmware 239.871.768, kernel 6.19.8.
 
 Patchset: battery
 ---
- drivers/acpi/battery.c | 31 ++++++++++++++++++++++++++++++-
- 1 file changed, 30 insertions(+), 1 deletion(-)
+ drivers/acpi/battery.c | 99 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 97 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/acpi/battery.c b/drivers/acpi/battery.c
-index 34181fa..b00c758 100644
+index 34181fa..0b1433c 100644
 --- a/drivers/acpi/battery.c
 +++ b/drivers/acpi/battery.c
-@@ -52,6 +52,7 @@ MODULE_LICENSE("GPL");
+@@ -44,6 +44,13 @@
+ 
+ #define MAX_STRING_LENGTH	64
+ 
++/*
++ * Minimum window over which a rate is derived from the capacity counter, and
++ * the point at which we stop waiting for the counter to move at all.
++ */
++#define ACPI_BATTERY_RATE_WINDOW_SEC		60
++#define ACPI_BATTERY_RATE_MAX_WINDOW_SEC	600
++
+ MODULE_AUTHOR("Paul Diefenbaugh");
+ MODULE_AUTHOR("Alexey Starikovskiy <astarikovskiy@suse.de>");
+ MODULE_DESCRIPTION("ACPI Battery Driver");
+@@ -52,6 +59,7 @@ MODULE_LICENSE("GPL");
  static int battery_bix_broken_package;
  static int battery_notification_delay_ms;
  static int battery_ac_is_broken;
@@ -50,23 +81,112 @@ index 34181fa..b00c758 100644
  static unsigned int cache_time = 1000;
  module_param(cache_time, uint, 0644);
  MODULE_PARM_DESC(cache_time, "cache time in milliseconds");
-@@ -242,7 +243,14 @@ static int acpi_battery_get_property(struct power_supply *psy,
+@@ -123,6 +131,10 @@ struct acpi_battery {
+ 	char oem_info[MAX_STRING_LENGTH];
+ 	int state;
+ 	int power_unit;
++	/* Rate derived from the capacity counter, for broken-rate firmware. */
++	int rate_derived;
++	int rate_ref_capacity;
++	unsigned long rate_ref_time;
+ 	unsigned long flags;
+ };
+ 
+@@ -200,6 +212,7 @@ static int acpi_battery_get_property(struct power_supply *psy,
+ {
+ 	int full_capacity = ACPI_BATTERY_VALUE_UNKNOWN, ret = 0;
+ 	struct acpi_battery *battery = to_acpi_battery(psy);
++	int rate;
+ 
+ 	if (acpi_battery_present(battery)) {
+ 		/* run battery update only if it is present */
+@@ -242,10 +255,12 @@ static int acpi_battery_get_property(struct power_supply *psy,
  		break;
  	case POWER_SUPPLY_PROP_CURRENT_NOW:
  	case POWER_SUPPLY_PROP_POWER_NOW:
 -		if (battery->rate_now == ACPI_BATTERY_VALUE_UNKNOWN)
-+		/*
-+		 * Some firmware reports a present rate that is off by an
-+		 * order of magnitude and fluctuates wildly. Reporting
-+		 * nothing is better than reporting a bogus value: userspace
-+		 * then derives the rate from the energy counter instead.
-+		 */
-+		if (battery->rate_now == ACPI_BATTERY_VALUE_UNKNOWN ||
-+		    battery_rate_is_broken)
++		rate = battery_rate_is_broken ? battery->rate_derived
++					      : battery->rate_now;
++		if (rate == ACPI_BATTERY_VALUE_UNKNOWN)
  			ret = -ENODEV;
  		else
- 			val->intval = battery->rate_now * 1000;
-@@ -1138,6 +1146,13 @@ battery_ac_is_broken_quirk(const struct dmi_system_id *d)
+-			val->intval = battery->rate_now * 1000;
++			val->intval = rate * 1000;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+ 	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
+@@ -559,6 +574,60 @@ static int acpi_battery_get_info(struct acpi_battery *battery)
+ 	return result;
+ }
+ 
++/*
++ * Derive a discharge rate by differentiating the capacity counter, for
++ * firmware whose reported rate cannot be used. Deliberately an average over
++ * at least ACPI_BATTERY_RATE_WINDOW_SEC: it is meant for runtime estimation
++ * and will not track short bursts.
++ */
++static void acpi_battery_derive_rate(struct acpi_battery *battery)
++{
++	unsigned long now = jiffies;
++	int delta_cap, delta_sec;
++
++	/*
++	 * Only a falling capacity counter tells us anything. Charging, full
++	 * and unknown-capacity all invalidate the window.
++	 */
++	if (!(battery->state & ACPI_BATTERY_STATE_DISCHARGING) ||
++	    battery->capacity_now == ACPI_BATTERY_VALUE_UNKNOWN) {
++		battery->rate_derived = ACPI_BATTERY_VALUE_UNKNOWN;
++		battery->rate_ref_time = 0;
++		return;
++	}
++
++	/* Start of a window, or a counter that moved the wrong way. */
++	if (!battery->rate_ref_time ||
++	    battery->capacity_now > battery->rate_ref_capacity) {
++		battery->rate_ref_capacity = battery->capacity_now;
++		battery->rate_ref_time = now;
++		return;
++	}
++
++	delta_sec = (now - battery->rate_ref_time) / HZ;
++	if (delta_sec < ACPI_BATTERY_RATE_WINDOW_SEC)
++		return;
++
++	delta_cap = battery->rate_ref_capacity - battery->capacity_now;
++
++	/*
++	 * The counter is quantised (10 mWh on a Surface Pro 5), so at a low
++	 * draw the window can close before one step is consumed. Keep growing
++	 * it rather than reporting a bogus zero, but give up eventually so a
++	 * stale value cannot persist forever.
++	 */
++	if (!delta_cap && delta_sec < ACPI_BATTERY_RATE_MAX_WINDOW_SEC)
++		return;
++
++	/*
++	 * mWh over seconds to mW (or mAh to mA). delta_cap cannot exceed the
++	 * pack's full capacity, so this stays well inside an int.
++	 */
++	battery->rate_derived = delta_cap * 3600 / delta_sec;
++	battery->rate_ref_capacity = battery->capacity_now;
++	battery->rate_ref_time = now;
++}
++
+ static int acpi_battery_get_state(struct acpi_battery *battery)
+ {
+ 	int result = 0;
+@@ -611,6 +680,9 @@ static int acpi_battery_get_state(struct acpi_battery *battery)
+ 	    battery->capacity_now > battery->full_charge_capacity)
+ 		battery->capacity_now = battery->full_charge_capacity;
+ 
++	if (battery_rate_is_broken)
++		acpi_battery_derive_rate(battery);
++
+ 	return result;
+ }
+ 
+@@ -1138,6 +1210,13 @@ battery_ac_is_broken_quirk(const struct dmi_system_id *d)
  	return 0;
  }
  
@@ -80,7 +200,7 @@ index 34181fa..b00c758 100644
  static const struct dmi_system_id bat_dmi_table[] __initconst = {
  	{
  		/* NEC LZ750/LS */
-@@ -1174,6 +1189,20 @@ static const struct dmi_system_id bat_dmi_table[] __initconst = {
+@@ -1174,6 +1253,20 @@ static const struct dmi_system_id bat_dmi_table[] __initconst = {
  			DMI_MATCH(DMI_PRODUCT_NAME, "Surface Go 3"),
  		},
  	},
@@ -93,13 +213,29 @@ index 34181fa..b00c758 100644
 +			 * This has to be an exact match: DMI_MATCH() is a
 +			 * substring match and "Surface Pro" is a prefix of
 +			 * every later model name ("Surface Pro 7", ...),
-+			 * which do report the rate correctly.
++			 * which are not known to be affected.
 +			 */
 +			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Surface Pro"),
 +		},
 +	},
  	{},
  };
+ 
+@@ -1223,6 +1316,7 @@ static int acpi_battery_add(struct acpi_device *device)
+ 	if (!battery)
+ 		return -ENOMEM;
+ 	battery->device = device;
++	battery->rate_derived = ACPI_BATTERY_VALUE_UNKNOWN;
+ 	strscpy(acpi_device_name(device), ACPI_BATTERY_DEVICE_NAME);
+ 	strscpy(acpi_device_class(device), ACPI_BATTERY_CLASS);
+ 	device->driver_data = battery;
+@@ -1297,6 +1391,7 @@ static int acpi_battery_resume(struct device *dev)
+ 		return -EINVAL;
+ 
+ 	battery->update_time = 0;
++	battery->rate_ref_time = 0;
+ 
+ 	guard(mutex)(&battery->update_lock);
  
 -- 
 2.53.0
