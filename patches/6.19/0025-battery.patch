@@ -1,0 +1,106 @@
+From 737047b331d63a5c0455e1b77a1596f32040a3ff Mon Sep 17 00:00:00 2001
+From: Rohan Sharma <rohansh.lko@gmail.com>
+Date: Thu, 1 Oct 2026 15:55:24 +0200
+Subject: [PATCH] ACPI: battery: Ignore bogus _BST present rate on Surface Pro
+ 5
+
+The Surface Pro 5 (Surface Pro 2017) reports a present rate in _BST
+that is both far too large and extremely unstable. Measured on an
+m3-7Y30 / 45Wh unit at an idle desktop:
+
+  energy_now delta over 120s:    2.40 W   (ground truth)
+  power_now as reported:        33.78 W
+  rate seen by upower:          12.9 W .. 60.5 W within 90s
+
+2.40 W is the real figure: it matches the observed 15-20h runtime and
+is the only value consistent with the hardware. 60 W is impossible on
+this machine several times over - the m3-7Y30 is a 4.5 W TDP fanless
+part, and the bundled Surface Connect PSU supplies at most 44 W, so
+the pack cannot source that power even in principle.
+
+The practical fallout is that upower's energy-rate is garbage, so the
+desktop reports "3.0 hours" remaining on a battery that actually lasts
+roughly 16 hours.
+
+The capacity values from _BST are sound, so only the rate is
+suppressed. Once power_now is gone userspace falls back to
+differentiating the energy counter, which tracks the real draw.
+
+The DMI match is deliberately exact. DMI_MATCH() is a substring match
+and the 2017 model's product name, "Surface Pro", is a prefix of every
+later model ("Surface Pro 7" and so on), which are not known to be
+affected.
+
+Tested on Surface Pro 2017, firmware 239.871.768, kernel 6.19.8.
+
+Patchset: battery
+---
+ drivers/acpi/battery.c | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/acpi/battery.c b/drivers/acpi/battery.c
+index 34181fa..b00c758 100644
+--- a/drivers/acpi/battery.c
++++ b/drivers/acpi/battery.c
+@@ -52,6 +52,7 @@ MODULE_LICENSE("GPL");
+ static int battery_bix_broken_package;
+ static int battery_notification_delay_ms;
+ static int battery_ac_is_broken;
++static int battery_rate_is_broken;
+ static unsigned int cache_time = 1000;
+ module_param(cache_time, uint, 0644);
+ MODULE_PARM_DESC(cache_time, "cache time in milliseconds");
+@@ -242,7 +243,14 @@ static int acpi_battery_get_property(struct power_supply *psy,
+ 		break;
+ 	case POWER_SUPPLY_PROP_CURRENT_NOW:
+ 	case POWER_SUPPLY_PROP_POWER_NOW:
+-		if (battery->rate_now == ACPI_BATTERY_VALUE_UNKNOWN)
++		/*
++		 * Some firmware reports a present rate that is off by an
++		 * order of magnitude and fluctuates wildly. Reporting
++		 * nothing is better than reporting a bogus value: userspace
++		 * then derives the rate from the energy counter instead.
++		 */
++		if (battery->rate_now == ACPI_BATTERY_VALUE_UNKNOWN ||
++		    battery_rate_is_broken)
+ 			ret = -ENODEV;
+ 		else
+ 			val->intval = battery->rate_now * 1000;
+@@ -1138,6 +1146,13 @@ battery_ac_is_broken_quirk(const struct dmi_system_id *d)
+ 	return 0;
+ }
+ 
++static int __init
++battery_rate_is_broken_quirk(const struct dmi_system_id *d)
++{
++	battery_rate_is_broken = 1;
++	return 0;
++}
++
+ static const struct dmi_system_id bat_dmi_table[] __initconst = {
+ 	{
+ 		/* NEC LZ750/LS */
+@@ -1174,6 +1189,20 @@ static const struct dmi_system_id bat_dmi_table[] __initconst = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "Surface Go 3"),
+ 		},
+ 	},
++	{
++		/* Microsoft Surface Pro 5 (2017) */
++		.callback = battery_rate_is_broken_quirk,
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Microsoft Corporation"),
++			/*
++			 * This has to be an exact match: DMI_MATCH() is a
++			 * substring match and "Surface Pro" is a prefix of
++			 * every later model name ("Surface Pro 7", ...),
++			 * which do report the rate correctly.
++			 */
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Surface Pro"),
++		},
++	},
+ 	{},
+ };
+ 
+-- 
+2.53.0
+
